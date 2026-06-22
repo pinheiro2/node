@@ -1,0 +1,356 @@
+name: Build from tarball - Falco adjusted
+
+on: workflow_dispatch
+
+env:
+  PYTHON_VERSION: '3.14'
+  FLAKY_TESTS: keep_retrying
+  CLANG_VERSION: '19'
+
+permissions:
+  contents: read
+
+jobs:
+  build-tarball:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Setup Metrics & Start Monitor
+        run: |
+          sudo apt-get update && sudo apt-get install -y sysstat
+          mkdir -p /tmp/metrics
+          # Standardized internal filenames
+          pidstat -u -r -d -l 1 > /tmp/metrics/pidstat.log &
+          echo $! > /tmp/metrics/monitor.pid
+          echo "START_TIME=$(date +%s.%N)" > /tmp/metrics/timing.env
+          echo "Started monitoring and timing..."
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      - name: Environment Information
+        run: npx envinfo
+      - name: Make tarball
+        run: |
+          export DISTTYPE=nightly
+          export DATESTRING=$(date "+%Y-%m-%d")
+          export COMMIT=$(git rev-parse --short=10 "$GITHUB_SHA")
+          ./configure && make tar -j4 SKIP_XZ=1
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: tarballs
+          path: '*.tar.gz'
+          compression-level: 0
+
+      - name: Stop Monitor & Record Time
+        # always() ensures the monitor stops and uploads even if the script fails
+        if: always() 
+        run: |
+          END_TIME=$(date +%s.%N)
+          source /tmp/metrics/timing.env
+          DURATION=$(awk "BEGIN {print $END_TIME - $START_TIME}")
+          echo "END_TIME=$END_TIME" >> /tmp/metrics/timing.env
+          echo "DURATION=$DURATION" >> /tmp/metrics/timing.env
+          
+          kill $(cat /tmp/metrics/monitor.pid) || true
+          echo "Stopped monitoring. Total time: $DURATION seconds."
+      
+      - name: Export Original Analyze Metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-build-${{ github.run_id }}
+          path: /tmp/metrics/
+
+  ebpf_build:
+    runs-on: ubuntu-24.04
+    steps:
+
+      - name: Setup Metrics & Start Monitor
+        run: |
+          sudo apt-get update && sudo apt-get install -y sysstat
+          mkdir -p /tmp/metrics
+          # Standardized internal filenames
+          pidstat -u -r -d -l 1 > /tmp/metrics/pidstat.log &
+          echo $! > /tmp/metrics/monitor.pid
+          echo "START_TIME=$(date +%s.%N)" > /tmp/metrics/timing.env
+          echo "Started monitoring and timing..."
+
+      - name: Start Falco
+        uses: falcosecurity/falco-actions/start@54d299d4c40de1ad6bf680fefbbfed1bc5b8f057
+        with:
+          mode: analyze
+          cicd-rules: true
+
+       # OBSERVED WORKLOAD STARTS HERE   
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          allow-prereleases: true
+      - name: Environment Information
+        run: npx envinfo
+      - name: Make tarball
+        run: |
+          export DISTTYPE=nightly
+          export DATESTRING=$(date "+%Y-%m-%d")
+          export COMMIT=$(git rev-parse --short=10 "$GITHUB_SHA")
+          ./configure && make tar -j4 SKIP_XZ=1
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: tarballs
+          path: '*.tar.gz'
+          compression-level: 0
+
+      # OBSERVED WORKLOAD STARTS HERE
+      
+      - name: Stop Falco
+        uses: falcosecurity/falco-actions/stop@54d299d4c40de1ad6bf680fefbbfed1bc5b8f057
+        with:
+          mode: analyze
+      
+      - name: Stop Monitor & Record Time
+        # always() ensures the monitor stops and uploads even if the script fails
+        if: always() 
+        run: |
+          END_TIME=$(date +%s.%N)
+          source /tmp/metrics/timing.env
+          DURATION=$(awk "BEGIN {print $END_TIME - $START_TIME}")
+          echo "END_TIME=$END_TIME" >> /tmp/metrics/timing.env
+          echo "DURATION=$DURATION" >> /tmp/metrics/timing.env
+          
+          kill $(cat /tmp/metrics/monitor.pid) || true
+          echo "Stopped monitoring. Total time: $DURATION seconds."
+      
+      - name: Export Original Analyze Metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-ebpf_build-${{ github.run_id }}
+          path: /tmp/metrics/
+      
+  analyze:
+    runs-on: ubuntu-24.04
+    needs: ebpf_build
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Setup Metrics & Start Monitor
+        run: |
+          sudo apt-get update && sudo apt-get install -y sysstat
+          mkdir -p /tmp/metrics
+          # Standardized internal filenames
+          pidstat -u -r -d -l 1 > /tmp/metrics/pidstat.log &
+          echo $! > /tmp/metrics/monitor.pid
+          echo "START_TIME=$(date +%s.%N)" > /tmp/metrics/timing.env
+          echo "Started monitoring and timing..."
+
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Download Falco Capture Artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: capture 
+          path: ./falco-data
+
+      - name: Create Custom Falco Rule
+        run: |
+          cat << 'EOF' > ./falco-data/custom_rules.yaml
+          - rule: Detect Privilege Escalation (Behavioral Syscall)
+            desc: Detect direct kernel syscalls modifying file permissions (bypasses execve)
+            condition: >
+              evt.type in (chmod, fchmod, fchmodat, chown, lchown, fchown, fchownat) and
+              not proc.name in (dpkg, apt, rpm, tar, actions-runner, dockerd, containerd, runc)
+            output: >
+              File permissions modified directly via syscall (file=%fd.name syscall=%evt.type cmdline=%proc.cmdline pid=%proc.pid ppid=%proc.ppid)
+            priority: WARNING
+            tags: [thesis_privesc]
+
+          - rule: Detect Sensitive File Read
+            desc: Detect when a process reads a potentially sensitive file
+            condition: evt.type in (open, openat, openat2) and fd.name in (/etc/timezone, /etc/passwd, /etc/shadow)
+            output: >
+              Sensitive file accessed (file=%fd.name cmdline=%proc.cmdline pid=%proc.pid ppid=%proc.ppid)
+            priority: WARNING
+            tags: [thesis_exfil]  
+
+          - rule: Detect True Reverse Shell (Behavioral Syscall)
+            desc: Detect a process redirecting standard I/O to a network socket
+            condition: >
+              evt.type in (dup, dup2, dup3) and
+              evt.arg.oldfd in (0, 1, 2) and
+              fd.type in (ipv4, ipv6)
+            output: >
+              Reverse shell behavior detected via file descriptor duplication (cmdline=%proc.cmdline pid=%proc.pid ppid=%proc.ppid)
+            priority: CRITICAL
+            tags: [thesis_tty] 
+
+          - rule: Detect Environment Variable Access
+            desc: Detect attempts to read environment variables from the /proc directory
+            condition: evt.type in (open, openat, openat2) and fd.name glob "/proc/*/environ"
+            output: >
+              Environment variables accessed (file=%fd.name cmdline=%proc.cmdline pid=%proc.pid ppid=%proc.ppid)
+            priority: WARNING
+            tags: [thesis_env]  
+
+          - rule: Detect Suspicious Dropper/Staging Activity
+            desc: Catch malware writing new files to temp directories (bypasses tar/zip execve)
+            condition: >
+              evt.type in (open, openat, openat2) and 
+              evt.arg.flags contains "O_CREAT" and evt.arg.flags contains "O_WRONLY" and
+              (fd.name startswith "/tmp/" or fd.name startswith "/dev/shm/") and
+              not proc.name in (npm, yarn, pip, git, actions-runner)
+            output: >
+              File created in temp staging directory (file=%fd.name cmdline=%proc.cmdline pid=%proc.pid ppid=%proc.ppid)
+            priority: WARNING
+            tags: [thesis_staging]
+              
+          - rule: Detect Outbound Network Activity
+            desc: Catch ANY process establishing an outbound network connection
+            condition: >
+              evt.type = connect and fd.type in (ipv4, ipv6) and 
+              not proc.name in (docker, dockerd, containerd, runc, actions-runner)
+            output: >
+              Outbound connection established (connection=%fd.name cmdline=%proc.cmdline pid=%proc.pid ppid=%proc.ppid)
+            priority: WARNING
+            tags: [thesis_network_exfil]
+
+          - rule: Detect Suspicious Interpreter Inline Execution
+            desc: Catch Python/Node executing large inline scripts with networking/encoding
+            condition: >
+              evt.type = execve and 
+              proc.name in (python, python3, node, perl, ruby) and 
+              (proc.cmdline contains "-c" or proc.cmdline contains "-e") and
+              (proc.cmdline contains "urllib" or proc.cmdline contains "requests" or proc.cmdline contains "base64")
+            output: >
+              Suspicious inline interpreter execution (cmdline=%proc.cmdline pid=%proc.pid ppid=%proc.ppid)
+            priority: WARNING
+            tags: [thesis_lotl_abuse]  
+
+          - rule: Catch All Process Executions
+            desc: Log every single process execution to build a tree later
+            condition: evt.type = execve
+            output: >
+              Process spawned (cmdline=%proc.cmdline pid=%proc.pid ppid=%proc.ppid)
+            priority: INFO
+            tags: [thesis_process_tree]  
+          EOF
+
+      - name: Run Falco Container
+        run: |
+          docker run --rm -v ${{ github.workspace }}/falco-data:/workspace falcosecurity/falco-no-driver:0.39.0 \
+            falco -o engine.kind=replay \
+            -o engine.replay.capture_file=/workspace/capture.scap \
+            -r /workspace/custom_rules.yaml \
+            -o json_output=true \
+            -o json_include_output_property=true \
+            -o file_output.enabled=true \
+            -o file_output.filename=/workspace/falco_events.json
+
+      - name: Upload Falco JSON Events
+        uses: actions/upload-artifact@v7
+        with:
+          name: falco-json-output
+          path: ./falco-data/falco_events.json
+          if-no-files-found: error
+
+      - name: Download Previous Security Baseline
+        uses: dawidd6/action-download-artifact@v21
+        continue-on-error: true
+        with:
+          name: security-baseline
+          path: ./falco-data/
+          branch: main
+
+      - name: Download Executable Hashes Artifact
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: hashes 
+          path: ./falco-data
+
+      - name: Generate Process Tree Summary
+        run: python3 .github/scripts/baseline_generate_tree.py
+
+      - name: Upload New Security Baseline
+        uses: actions/upload-artifact@v7
+        with:
+          name: security-baseline
+          path: ./falco-data/baseline.json
+      
+      - name: Stop Monitor & Record Time
+        # always() ensures the monitor stops and uploads even if the script fails
+        if: always() 
+        run: |
+          END_TIME=$(date +%s.%N)
+          source /tmp/metrics/timing.env
+          DURATION=$(awk "BEGIN {print $END_TIME - $START_TIME}")
+          echo "END_TIME=$END_TIME" >> /tmp/metrics/timing.env
+          echo "DURATION=$DURATION" >> /tmp/metrics/timing.env
+          
+          kill $(cat /tmp/metrics/monitor.pid) || true
+          echo "Stopped monitoring. Total time: $DURATION seconds."
+
+      - name: Export Analyze Metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-analyze-${{ github.run_id }}
+          path: /tmp/metrics/
+
+  original_analyze:
+      runs-on: ubuntu-24.04
+      needs: ebpf_build
+      permissions:
+        contents: read
+        actions: read
+      steps:
+        - name: Setup Metrics & Start Monitor
+          run: |
+            sudo apt-get update && sudo apt-get install -y sysstat
+            mkdir -p /tmp/metrics
+            # Standardized internal filenames
+            pidstat -u -r -d -l 1 > /tmp/metrics/pidstat.log &
+            echo $! > /tmp/metrics/monitor.pid
+            echo "START_TIME=$(date +%s.%N)" > /tmp/metrics/timing.env
+            echo "Started monitoring and timing..."
+
+        - name: Analyze
+          uses: falcosecurity/falco-actions/analyze@54d299d4c40de1ad6bf680fefbbfed1bc5b8f057
+          with:
+            falco-version: '0.39.0'
+            extract-written-files: true
+            extract-chisels: true
+            extract-hashes: true   
+        
+        - name: Stop Monitor & Record Time
+          # always() ensures the monitor stops and uploads even if the script fails
+          if: always() 
+          run: |
+            END_TIME=$(date +%s.%N)
+            source /tmp/metrics/timing.env
+            DURATION=$(awk "BEGIN {print $END_TIME - $START_TIME}")
+            echo "END_TIME=$END_TIME" >> /tmp/metrics/timing.env
+            echo "DURATION=$DURATION" >> /tmp/metrics/timing.env
+            
+            kill $(cat /tmp/metrics/monitor.pid) || true
+            echo "Stopped monitoring. Total time: $DURATION seconds."
+          
+        - name: Export Original Analyze Metrics
+          if: always()
+          uses: actions/upload-artifact@v4
+          with:
+            name: metrics-original_analyze-${{ github.run_id }}
+            path: /tmp/metrics/
